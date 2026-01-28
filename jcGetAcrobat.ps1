@@ -13,6 +13,9 @@ Adobe Acrobat Audit (2017/2020) - JumpCloud EU
 - Checks System Insights:
   - Windows: v2/systeminsights/programs
   - macOS/Linux: v2/systeminsights/apps
+- Also resolves bound user(s) for each system:
+  - v2/systems/{system_id}/users (traverse)
+  - Then resolves each user id into username + email (systemusers / v2 fallbacks)
 - Outputs:
   - CLI summary + details
   - CSV: JC_AcrobatHits.csv
@@ -64,11 +67,6 @@ $SoftwareSignatures = @(
 # -------------------------------------------------
 # Function Invoke-JCRequest
 # -------------------------------------------------
-# Resilient JumpCloud API request wrapper.
-# - Uses EU base URI and headers (x-api-key, optional x-org-id).
-# - Retries transient errors (429/408/5xx/timeouts) with backoff.
-# - Returns the parsed JSON object from Invoke-RestMethod.
-#
 function Invoke-JCRequest
 {
     param(
@@ -133,10 +131,6 @@ function Invoke-JCRequest
 # -------------------------------------------------
 # Function Unwrap-Results
 # -------------------------------------------------
-# Normalize JumpCloud responses to a plain array.
-# - If API returns { results: [...] }, returns .results.
-# - Otherwise returns the object as an array.
-#
 function Unwrap-Results
 {
     param([Parameter(Mandatory)]$Response)
@@ -149,9 +143,6 @@ function Unwrap-Results
 # -------------------------------------------------
 # Function Resolve-Platform
 # -------------------------------------------------
-# Normalize a system object to: Windows | macOS | Linux | Other.
-# - Uses multiple possible platform fields coming from search/systems results.
-#
 function Resolve-Platform
 {
     param($s)
@@ -189,8 +180,6 @@ function Resolve-Platform
 # -------------------------------------------------
 # Function Coerce-Date
 # -------------------------------------------------
-# Convert various timestamp formats into a UTC [datetime].
-#
 function Coerce-Date
 {
     param($v)
@@ -210,8 +199,6 @@ function Coerce-Date
 # -------------------------------------------------
 # Function Pick-LastContact
 # -------------------------------------------------
-# Extract a "last contact" timestamp from a system object.
-#
 function Pick-LastContact
 {
     param($s)
@@ -254,22 +241,14 @@ function Pick-LastContact
 # -------------------------------------------------
 # Function Get-FilteredSystems
 # -------------------------------------------------
-# Fetch only Windows/macOS/Linux systems using POST /api/search/systems.
-# - search/systems does NOT accept logical operators like '$or' as filter fields.
-# - Instead, we run 3 compatible queries (one per OS family) and merge unique systems.
-# - Uses limit/skip pagination per query.
-# - Returns a flat array of unique system objects.
-#
 function Get-FilteredSystems
 {
-    # OS regex queries (tune if needed)
     $osQueries = @(
         @{ Label = 'Windows'; Regex = '(?i)windows' }
         @{ Label = 'macOS';   Regex = '(?i)mac|os\s*x|darwin|macos' }
         @{ Label = 'Linux';   Regex = '(?i)linux|ubuntu|debian|rhel|centos|fedora|suse' }
     )
 
-    # De-dupe by SystemID
     $byId = @{}
 
     foreach ($q in $osQueries)
@@ -330,12 +309,9 @@ function Get-FilteredSystems
     return @($byId.Values)
 }
 
-
 # -------------------------------------------------
 # Function Get-ProgramsForSystem
 # -------------------------------------------------
-# Fetch System Insights "programs" inventory for one system (Windows).
-#
 function Get-ProgramsForSystem
 {
     param([Parameter(Mandatory)][string]$SystemId)
@@ -360,8 +336,6 @@ function Get-ProgramsForSystem
 # -------------------------------------------------
 # Function Get-AppsForSystem
 # -------------------------------------------------
-# Fetch System Insights "apps" inventory for one system (macOS/Linux).
-#
 function Get-AppsForSystem
 {
     param([Parameter(Mandatory)][string]$SystemId)
@@ -384,13 +358,242 @@ function Get-AppsForSystem
 }
 
 # -------------------------------------------------
+# Bound Users: cache + resolve username/email (no internal ids in output)
+# -------------------------------------------------
+$BoundUserCache = @{}
+$UserDetailCache = @{}
+
+# -------------------------------------------------
+# Function Try-GetUserDetailsByPath
+# -------------------------------------------------
+# Helper: tries a specific API path for a user object and extracts username/email.
+# Returns $null if the path fails or has no usable identity fields.
+#
+function Try-GetUserDetailsByPath
+{
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    try
+    {
+        $u = Invoke-JCRequest -Path $Path -Method GET
+    }
+    catch
+    {
+        return $null
+    }
+
+    if (-not $u) { return $null }
+
+    $username = $null
+    $email    = $null
+
+    if ($u.username) { $username = [string]$u.username }
+    if (-not $username -and $u.login) { $username = [string]$u.login }
+
+    if ($u.email) { $email = [string]$u.email }
+
+    if ((-not $email) -and ($u.emails))
+    {
+        try
+        {
+            if ($u.emails -is [System.Array])
+            {
+                $email = [string]($u.emails | Select-Object -First 1)
+            }
+            else
+            {
+                $email = [string]$u.emails
+            }
+        }
+        catch { }
+    }
+
+    if ($u.PSObject.Properties.Name -contains 'attributes')
+    {
+        $a = $u.attributes
+        if (-not $username -and $a.username) { $username = [string]$a.username }
+        if (-not $email    -and $a.email)    { $email    = [string]$a.email }
+    }
+
+    $username = if ($username -and -not [string]::IsNullOrWhiteSpace($username)) { $username.Trim() } else { $null }
+    $email    = if ($email    -and -not [string]::IsNullOrWhiteSpace($email))    { $email.Trim() }    else { $null }
+
+    if (-not $username -and -not $email)
+    {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Username = $username
+        Email    = $email
+    }
+}
+
+# -------------------------------------------------
+# Function Get-JCUserDetails
+# -------------------------------------------------
+# Resolves a JumpCloud user id to username + email.
+# Tries multiple API shapes (tenants differ), but never returns the internal id.
+#
+function Get-JCUserDetails
+{
+    param([Parameter(Mandatory)][string]$UserId)
+
+    if ($UserDetailCache.ContainsKey($UserId))
+    {
+        return $UserDetailCache[$UserId]
+    }
+
+    $detail = $null
+
+    # Most common legacy user endpoint
+    $detail = Try-GetUserDetailsByPath -Path "systemusers/$UserId"
+
+    # Fallbacks (best-effort; harmless if not supported in your tenant)
+    if (-not $detail) { $detail = Try-GetUserDetailsByPath -Path "v2/systemusers/$UserId" }
+    if (-not $detail) { $detail = Try-GetUserDetailsByPath -Path "v2/users/$UserId" }
+
+    $UserDetailCache[$UserId] = $detail
+    return $detail
+}
+
+# -------------------------------------------------
+# Function Format-UserIdentity
+# -------------------------------------------------
+# Produces: "account <email>" or "account" (if no email) or $null (if unknown).
+#
+function Format-UserIdentity
+{
+    param(
+        [string]$Username,
+        [string]$Email
+    )
+
+    $u = if ($Username -and -not [string]::IsNullOrWhiteSpace($Username)) { $Username.Trim() } else { $null }
+    $e = if ($Email    -and -not [string]::IsNullOrWhiteSpace($Email))    { $Email.Trim() }    else { $null }
+
+    if ($u -and $e)
+    {
+        return ("{0} <{1}>" -f $u, $e)
+    }
+    if ($u)
+    {
+        return $u
+    }
+    if ($e)
+    {
+        return $e
+    }
+
+    return $null
+}
+
+# -------------------------------------------------
+# Function Get-BoundUsersForSystem
+# -------------------------------------------------
+# Fetch bound users for a system using traverse:
+#   GET v2/systems/{SystemID}/users
+# Then resolves each user id into username/email.
+# Returns a single string:
+#   - "jdoe <jdoe@company.com>; asmith <asmith@company.com>"
+#   - "none" if no bound user detected OR if identities cannot be resolved
+#
+function Get-BoundUsersForSystem
+{
+    param([Parameter(Mandatory)][string]$SystemId)
+
+    $all  = @()
+    $skip = 0
+
+    while ($true)
+    {
+        $path  = "v2/systems/$SystemId/users?limit=$ItemPageSize&skip=$skip"
+        $resp  = Invoke-JCRequest -Path $path -Method GET
+        $batch = Unwrap-Results -Response $resp
+
+        if (-not $batch -or $batch.Count -eq 0)
+        {
+            break
+        }
+
+        $all += $batch
+
+        if ($batch.Count -lt $ItemPageSize)
+        {
+            break
+        }
+
+        $skip += $batch.Count
+    }
+
+    # Collect user IDs from traverse results
+    $userIds = foreach ($u in $all)
+    {
+        $uid = $null
+        if ($u.id) { $uid = [string]$u.id }
+        if (-not $uid -and $u._id) { $uid = [string]$u._id }
+        if ($uid -and -not [string]::IsNullOrWhiteSpace($uid))
+        {
+            $uid.Trim()
+        }
+    }
+
+    $userIds = @($userIds | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if (-not $userIds -or $userIds.Count -eq 0)
+    {
+        return "none"
+    }
+
+    # Resolve each user id into username/email; never return internal IDs
+    $idents = foreach ($uid in $userIds)
+    {
+        $det = Get-JCUserDetails -UserId $uid
+        if (-not $det) { continue }
+
+        $txt = Format-UserIdentity -Username $det.Username -Email $det.Email
+        if ($txt) { $txt }
+    }
+
+    $idents = @($idents | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if (-not $idents -or $idents.Count -eq 0)
+    {
+        return "none"
+    }
+
+    return ($idents -join "; ")
+}
+
+# -------------------------------------------------
+# Function Get-BoundUsersCached
+# -------------------------------------------------
+function Get-BoundUsersCached
+{
+    param([Parameter(Mandatory)][string]$SystemId)
+
+    if ($BoundUserCache.ContainsKey($SystemId))
+    {
+        return $BoundUserCache[$SystemId]
+    }
+
+    $val = "none"
+    try
+    {
+        $val = Get-BoundUsersForSystem -SystemId $SystemId
+    }
+    catch
+    {
+        $val = "none"
+    }
+
+    $BoundUserCache[$SystemId] = $val
+    return $val
+}
+
+# -------------------------------------------------
 # Function Test-SoftwareMatch
 # -------------------------------------------------
-# Check one inventory item against the signature list.
-# - Matches primarily on "name" (with year).
-# - Uses "publisher" as a secondary check when present.
-# - Returns a small match object, or $null.
-#
 function Test-SoftwareMatch
 {
     param(
@@ -514,6 +717,9 @@ foreach ($d in $devices)
             try { $lastLocal = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId($d.LastContact, [TimeZoneInfo]::Local.Id) } catch { $lastLocal = $d.LastContact }
         }
 
+        # Bound users (cached per system; output is username/email only, never internal IDs)
+        $boundUsers = Get-BoundUsersCached -SystemId $d.SystemID
+
         $results.Add([pscustomobject]@{
             MatchedPackage   = $m.Package
             Hostname         = $d.Hostname
@@ -521,6 +727,7 @@ foreach ($d in $devices)
             Version          = $version
             SoftwareName     = $it.name
             Vendor           = $vendor
+            BoundUsers       = $boundUsers
             SystemID         = $d.SystemID
             LastContactLocal = $lastLocal
             SourceEndpoint   = $endpoint
@@ -550,7 +757,7 @@ $sorted = $results | Sort-Object MatchedPackage, Platform, Hostname, SoftwareNam
 
 Write-Host "Detected matches:"
 $sorted |
-    Select-Object MatchedPackage, Hostname, Platform, Version, SoftwareName, Vendor, LastContactLocal |
+    Select-Object MatchedPackage, Hostname, Platform, Version, SoftwareName, Vendor, BoundUsers, LastContactLocal |
     Format-Table -AutoSize
 
 $sorted | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
